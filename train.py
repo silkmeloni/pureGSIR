@@ -1,6 +1,8 @@
 import os
 import sys
 import uuid
+import lpips # <--- 新增导入
+
 from argparse import ArgumentParser, Namespace
 from random import randint
 from typing import Dict, List, Optional, Tuple, Union
@@ -21,6 +23,8 @@ from scene import GaussianModel, Scene, Camera
 from utils.general_utils import safe_state
 from utils.image_utils import psnr, turbo_cmap
 from utils.loss_utils import l1_loss, ssim
+
+
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -137,6 +141,8 @@ def training(
     bound: float = 1.5,
     indirect: bool = False,
 ) -> None:
+    # === 新增 LPIPS 初始化 ===
+    lpips_fn = lpips.LPIPS(net='vgg').cuda()
     first_iter = 0
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
@@ -398,6 +404,7 @@ def training(
                 occlusion_volumes=occlusion_volumes,
                 irradiance_volumes=irradiance_volumes,
                 indirect=indirect,
+                lpips_fn=lpips_fn,
             )
             # NOTE: we same .pth instead of point cloud for additional irradiance volumes and cubemap
             # if iteration in saving_iterations:
@@ -493,6 +500,7 @@ def training_report(
     occlusion_volumes: Dict,
     irradiance_volumes: IrradianceVolumes,
     indirect: bool = False,
+    lpips_fn = None,  # <--- 新增这行
 ) -> None:
     if tb_writer:
         tb_writer.add_scalar("train_loss_patches/l1_loss", Ll1, iteration)
@@ -527,6 +535,7 @@ def training_report(
                 l1_test = 0.0
                 psnr_test = 0.0
                 ssim_test = 0.0
+                lpips_test = 0.0  # <--- 新增这行
                 for idx, viewpoint in enumerate(config["cameras"]):
                     viewpoint: Camera
                     render_result = render(
@@ -694,16 +703,30 @@ def training_report(
                         l1_test += F.l1_loss(render_rgb, gt_image).mean().double()
                         psnr_test += psnr(render_rgb, gt_image).mean().double()
                         ssim_test += ssim(render_rgb, gt_image).mean().double()
+                        # LPIPS 期望输入范围是 [-1, 1]，因此要做 (x * 2 - 1)，并增加 batch 维度
+                        lpips_test += lpips_fn((render_rgb * 2 - 1).unsqueeze(0),
+                                               (gt_image * 2 - 1).unsqueeze(0)).item()  # <--- 新增
                     else:
                         l1_test += F.l1_loss(image, gt_image).mean().double()
                         psnr_test += psnr(image, gt_image).mean().double()
                         ssim_test += ssim(image, gt_image).mean().double()
+                        lpips_test += lpips_fn((image * 2 - 1).unsqueeze(0),
+                                               (gt_image * 2 - 1).unsqueeze(0)).item()  # <--- 新增
                 psnr_test /= len(config["cameras"])
                 ssim_test /= len(config["cameras"])
                 l1_test /= len(config["cameras"])
-                print(
-                    f"\n[ITER {iteration}] Evaluating {config['name']}: L1 {l1_test:.6f} PSNR {psnr_test:.6f} SSIM {ssim_test:.6f}"
-                )
+                lpips_test /= len(config["cameras"])  # <--- 新增这行
+                # 构造要打印和写入的字符串
+                eval_msg = f"[ITER {iteration}] Evaluating {config['name']}: L1 {l1_test:.6f} PSNR {psnr_test:.6f} SSIM {ssim_test:.6f} LPIPS {lpips_test:.6f}"
+                # 打印到 Console
+                print(f"\n{eval_msg}")
+
+                # 写入到 Output 文件夹下的 txt 中
+                txt_path = os.path.join(scene.model_path, "eval_results.txt")
+                with open(txt_path, "a") as f:
+                    f.write(eval_msg + "\n")
+
+
                 if tb_writer:
                     tb_writer.add_scalar(
                         config["name"] + "/loss_viewpoint - l1_loss", l1_test, iteration
@@ -713,6 +736,10 @@ def training_report(
                     )
                     tb_writer.add_scalar(
                         config["name"] + "/loss_viewpoint - ssim", ssim_test, iteration
+                    )
+                    # 写入 Tensorboard
+                    tb_writer.add_scalar(
+                        config["name"] + "/loss_viewpoint - lpips", lpips_test, iteration  # <--- 新增这行
                     )
 
         if tb_writer:
